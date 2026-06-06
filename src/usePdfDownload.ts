@@ -4,7 +4,7 @@
 
 import { useCallback, useState } from "react";
 import type { PdfDoc } from "./types.js";
-import { generatePdf, pdfToBytes } from "./pdf.js";
+import { generatePdfBytes } from "./pdf.js";
 
 export interface UsePdfDownloadResult {
   /** Generate the PDF for `doc` and trigger a browser download. */
@@ -32,7 +32,7 @@ export function usePdfDownload(): UsePdfDownloadResult {
   const [error, setError] = useState<Error | null>(null);
 
   const toBlob = useCallback((doc: PdfDoc): Blob => {
-    const bytes = pdfToBytes(generatePdf(doc));
+    const bytes = generatePdfBytes(doc);
     // Copy into a fresh ArrayBuffer so the Blob owns its bytes.
     return new Blob([bytes.slice().buffer], { type: "application/pdf" });
   }, []);

@@ -1,6 +1,6 @@
 {
   "name": "react-pdf-generator",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Generate downloadable PDFs from React component definitions.",
   "type": "module",
   "license": "MIT",
@@ -20,7 +20,13 @@
     "typescript",
     "ui-components",
     "export",
-    "document"
+    "document",
+    "invoice",
+    "pdf-export",
+    "report",
+    "zero-dependency",
+    "pdf-table",
+    "client-side"
   ],
   "main": "dist/index.js",
   "module": "dist/index.js",
@@ -40,6 +46,7 @@
   "devDependencies": {
     "@testing-library/jest-dom": "^6.4.0",
     "@testing-library/react": "^16.0.0",
+    "@types/node": "^20.19.42",
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.3.0",
     "jsdom": "^24.0.0",

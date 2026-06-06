@@ -1,6 +1,17 @@
 import { describe, it, expect } from "vitest";
-import { generatePdf, layoutDocument, pdfToBytes } from "../pdf.js";
+import {
+  buildContentStream,
+  detectImageFormat,
+  extractPngIdat,
+  generatePdf,
+  generatePdfBytes,
+  layoutDocument,
+  pdfToBytes,
+  readPngHeader,
+} from "../pdf.js";
+import type { DrawOp, TextOp } from "../pdf.js";
 import type { PdfDoc } from "../types.js";
+import { makeJpeg, makePng } from "./fixtures.js";
 
 const sample: PdfDoc = {
   title: "Quarterly Report",
@@ -17,6 +28,15 @@ const sample: PdfDoc = {
     },
   ],
 };
+
+const decode = (bytes: Uint8Array): string => {
+  let s = "";
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return s;
+};
+
+const textOps = (ops: DrawOp[]): TextOp[] =>
+  ops.filter((o): o is TextOp => o.kind === "text");
 
 describe("generatePdf", () => {
   it("starts with the PDF header and ends with EOF", () => {
@@ -46,6 +66,12 @@ describe("generatePdf", () => {
     expect(pdf).toMatch(/\/Title \(Quarterly Report\)/);
   });
 
+  it("stores author and subject when provided", () => {
+    const pdf = generatePdf({ ...sample, author: "Viprasol", subject: "Earnings" });
+    expect(pdf).toMatch(/\/Author \(Viprasol\)/);
+    expect(pdf).toMatch(/\/Subject \(Earnings\)/);
+  });
+
   it("escapes parentheses in text so the PDF stays well-formed", () => {
     const pdf = generatePdf({ blocks: [{ type: "text", text: "net (loss)" }] });
     expect(pdf).toContain("net \\(loss\\)");
@@ -56,13 +82,285 @@ describe("generatePdf", () => {
     expect(pdf).toContain("/Type /Pages /Count 1");
   });
 
+  it("registers all four Helvetica font variants", () => {
+    const pdf = generatePdf(sample);
+    expect(pdf).toContain("/BaseFont /Helvetica ");
+    expect(pdf).toContain("/BaseFont /Helvetica-Bold ");
+    expect(pdf).toContain("/BaseFont /Helvetica-Oblique ");
+    expect(pdf).toContain("/BaseFont /Helvetica-BoldOblique ");
+  });
+
   it("xref offsets point at real object markers", () => {
     const pdf = generatePdf(sample);
-    // Object 1 should appear at the offset declared right after the free entry.
     const match = pdf.match(/xref\n0 \d+\n0000000000 65535 f \n(\d{10}) 00000 n /);
     expect(match).not.toBeNull();
     const offset = Number(match![1]);
     expect(pdf.slice(offset, offset + 7)).toBe("1 0 obj");
+  });
+
+  it("the trailer /Size matches the highest object number + 1", () => {
+    const pdf = generatePdf(sample);
+    const size = Number(pdf.match(/\/Size (\d+)/)![1]);
+    const lastObj = Math.max(
+      ...[...pdf.matchAll(/(\d+) 0 obj/g)].map((m) => Number(m[1])),
+    );
+    expect(size).toBe(lastObj + 1);
+  });
+});
+
+describe("generatePdfBytes", () => {
+  it("matches the string form for image-free documents", () => {
+    const bytes = generatePdfBytes(sample);
+    expect(decode(bytes)).toBe(generatePdf(sample));
+  });
+
+  it("emits a binary comment marker after the header", () => {
+    const bytes = generatePdfBytes(sample);
+    // Header is "%PDF-1.4\n%" then four high-bit bytes telling tools the file
+    // is binary. Those live at indices 10-13.
+    expect(bytes[10]).toBeGreaterThan(127);
+    expect(bytes[11]).toBeGreaterThan(127);
+  });
+});
+
+describe("font styles and color", () => {
+  it("selects the bold-oblique font for bold-italic text", () => {
+    const { pages } = layoutDocument({
+      blocks: [{ type: "text", text: "Strong emphasis", style: "bold-italic" }],
+    });
+    const op = textOps(pages[0])[0];
+    expect(op.style).toBe("bold-italic");
+    const stream = buildContentStream(pages[0]);
+    expect(stream).toContain("/F4 12 Tf");
+  });
+
+  it("italic flag maps to the oblique font", () => {
+    const { pages } = layoutDocument({
+      blocks: [{ type: "text", text: "Note", italic: true }],
+    });
+    expect(buildContentStream(pages[0])).toContain("/F3");
+  });
+
+  it("emits the requested fill color", () => {
+    const { pages } = layoutDocument({
+      blocks: [{ type: "text", text: "Red", color: { r: 255, g: 0, b: 0 } }],
+    });
+    const stream = buildContentStream(pages[0]);
+    expect(stream).toMatch(/1\.0000 0\.0000 0\.0000 rg/);
+  });
+});
+
+describe("alignment", () => {
+  it("centers and right-aligns text differently from left", () => {
+    const left = layoutDocument({ blocks: [{ type: "text", text: "Hi", align: "left" }] });
+    const center = layoutDocument({ blocks: [{ type: "text", text: "Hi", align: "center" }] });
+    const right = layoutDocument({ blocks: [{ type: "text", text: "Hi", align: "right" }] });
+    const lx = textOps(left.pages[0])[0].x;
+    const cx = textOps(center.pages[0])[0].x;
+    const rx = textOps(right.pages[0])[0].x;
+    expect(cx).toBeGreaterThan(lx);
+    expect(rx).toBeGreaterThan(cx);
+  });
+});
+
+describe("headings", () => {
+  it("supports levels 1 through 6 with descending sizes", () => {
+    const sizes = ([1, 2, 3, 4, 5, 6] as const).map((level) => {
+      const { pages } = layoutDocument({ blocks: [{ type: "heading", text: "H", level }] });
+      return textOps(pages[0])[0].fontSize;
+    });
+    for (let i = 1; i < sizes.length; i++) {
+      expect(sizes[i]).toBeLessThanOrEqual(sizes[i - 1]);
+    }
+    expect(sizes[0]).toBeGreaterThan(sizes[5]);
+  });
+});
+
+describe("lists", () => {
+  it("renders bullet markers for unordered lists", () => {
+    const { pages } = layoutDocument({
+      blocks: [{ type: "list", items: ["one", "two"] }],
+    });
+    const texts = textOps(pages[0]).map((o) => o.text);
+    expect(texts).toContain("•");
+    expect(texts).toContain("one");
+    expect(texts).toContain("two");
+  });
+
+  it("renders incrementing numbers for ordered lists", () => {
+    const { pages } = layoutDocument({
+      blocks: [{ type: "list", ordered: true, items: ["a", "b", "c"] }],
+    });
+    const texts = textOps(pages[0]).map((o) => o.text);
+    expect(texts).toContain("1.");
+    expect(texts).toContain("2.");
+    expect(texts).toContain("3.");
+  });
+});
+
+describe("divider and spacer", () => {
+  it("a divider produces a horizontal line op", () => {
+    const { pages } = layoutDocument({ blocks: [{ type: "divider" }] });
+    const lines = pages[0].filter((o) => o.kind === "line");
+    expect(lines.length).toBe(1);
+  });
+
+  it("a spacer pushes the next block down", () => {
+    const without = layoutDocument({
+      blocks: [{ type: "text", text: "A" }, { type: "text", text: "B" }],
+    });
+    const withSpacer = layoutDocument({
+      blocks: [{ type: "text", text: "A" }, { type: "spacer", height: 100 }, { type: "text", text: "B" }],
+    });
+    const yWithout = textOps(without.pages[0])[1].y;
+    const yWith = textOps(withSpacer.pages[0])[1].y;
+    expect(yWith).toBeLessThan(yWithout);
+  });
+});
+
+describe("page breaks", () => {
+  it("a pageBreak forces a new page", () => {
+    const { pages } = layoutDocument({
+      blocks: [
+        { type: "text", text: "first" },
+        { type: "pageBreak" },
+        { type: "text", text: "second" },
+      ],
+    });
+    expect(pages.length).toBe(2);
+    expect(textOps(pages[1]).map((o) => o.text)).toContain("second");
+  });
+});
+
+describe("tables", () => {
+  it("right-aligns a column when configured", () => {
+    const { pages } = layoutDocument({
+      blocks: [
+        {
+          type: "table",
+          columns: [{ align: "left" }, { align: "right" }],
+          rows: [["Item", "9999"]],
+        },
+      ],
+    });
+    const ops = textOps(pages[0]);
+    const item = ops.find((o) => o.text === "Item")!;
+    const value = ops.find((o) => o.text === "9999")!;
+    expect(value.x).toBeGreaterThan(item.x);
+  });
+
+  it("emits zebra shading rectangles for alternating rows", () => {
+    const { pages } = layoutDocument({
+      blocks: [
+        {
+          type: "table",
+          zebra: true,
+          rows: [["r0"], ["r1"], ["r2"], ["r3"]],
+        },
+      ],
+    });
+    const rects = pages[0].filter((o) => o.kind === "rect");
+    expect(rects.length).toBe(2); // rows 1 and 3 shaded
+  });
+
+  it("omits borders when borders:false", () => {
+    const noBorder = layoutDocument({
+      blocks: [{ type: "table", borders: false, rows: [["x"]] }],
+    });
+    const withBorder = layoutDocument({
+      blocks: [{ type: "table", rows: [["x"]] }],
+    });
+    expect(noBorder.pages[0].some((o) => o.kind === "line")).toBe(false);
+    expect(withBorder.pages[0].some((o) => o.kind === "line")).toBe(true);
+  });
+
+  it("repeats the header on each page a long table spans", () => {
+    const rows = Array.from({ length: 120 }, (_, i) => [`Row ${i}`, String(i)]);
+    const { pages } = layoutDocument({
+      blocks: [{ type: "table", header: ["Name", "Idx"], rows }],
+    });
+    expect(pages.length).toBeGreaterThan(1);
+    // The header text appears on every page.
+    for (const ops of pages) {
+      expect(textOps(ops).map((o) => o.text)).toContain("Name");
+    }
+  });
+});
+
+describe("images", () => {
+  const png = makePng(10, 6, [10, 20, 30]);
+  const jpeg = makeJpeg(40, 20);
+
+  it("detects PNG and JPEG signatures", () => {
+    expect(detectImageFormat(png)).toBe("png");
+    expect(detectImageFormat(jpeg)).toBe("jpeg");
+    expect(detectImageFormat(new Uint8Array([0, 1, 2]))).toBeNull();
+  });
+
+  it("reads the PNG header dimensions and color type", () => {
+    const header = readPngHeader(png)!;
+    expect(header.width).toBe(10);
+    expect(header.height).toBe(6);
+    expect(header.colorType).toBe(2);
+  });
+
+  it("extracts a non-empty IDAT stream from a PNG", () => {
+    expect(extractPngIdat(png).length).toBeGreaterThan(0);
+  });
+
+  it("embeds a JPEG as a DCTDecode XObject", () => {
+    const bytes = generatePdfBytes({ blocks: [{ type: "image", data: jpeg }] });
+    const str = decode(bytes);
+    expect(str).toContain("/Subtype /Image");
+    expect(str).toContain("/Filter /DCTDecode");
+    expect(str).toContain("/Im1 Do");
+  });
+
+  it("embeds a PNG via FlateDecode with a PNG predictor", () => {
+    const bytes = generatePdfBytes({ blocks: [{ type: "image", data: png }] });
+    const str = decode(bytes);
+    expect(str).toContain("/Filter /FlateDecode");
+    expect(str).toContain("/Predictor 15");
+    expect(str).toContain("/Width 10");
+  });
+
+  it("registers the XObject in page resources", () => {
+    const str = decode(generatePdfBytes({ blocks: [{ type: "image", data: jpeg }] }));
+    expect(str).toMatch(/\/XObject << \/Im1 \d+ 0 R >>/);
+  });
+
+  it("clamps oversized images to the content width", () => {
+    const { pages, width } = layoutDocument({
+      blocks: [{ type: "image", data: jpeg, width: 99999 }],
+    });
+    const img = pages[0].find((o) => o.kind === "image")!;
+    expect(img.kind).toBe("image");
+    if (img.kind === "image") expect(img.width).toBeLessThanOrEqual(width);
+  });
+});
+
+describe("page numbers", () => {
+  it("adds a footer to every page using the template", () => {
+    const rows = Array.from({ length: 120 }, (_, i) => [`Row ${i}`]);
+    const { pages } = layoutDocument({
+      pageNumbers: { template: "Page {page} of {total}" },
+      blocks: [{ type: "table", rows }],
+    });
+    expect(pages.length).toBeGreaterThan(1);
+    const footers = pages.map(
+      (ops) => textOps(ops).find((o) => o.text.startsWith("Page "))?.text,
+    );
+    expect(footers[0]).toBe(`Page 1 of ${pages.length}`);
+    expect(footers[pages.length - 1]).toBe(`Page ${pages.length} of ${pages.length}`);
+  });
+
+  it("uses the default template when pageNumbers is true", () => {
+    const { pages } = layoutDocument({
+      pageNumbers: true,
+      blocks: [{ type: "text", text: "hi" }],
+    });
+    const footer = textOps(pages[0]).find((o) => o.text.includes("/"));
+    expect(footer?.text).toBe("1 / 1");
   });
 });
 
@@ -81,11 +379,19 @@ describe("pagination", () => {
   it("places text within the page's vertical bounds", () => {
     const { pages, height } = layoutDocument(sample);
     for (const ops of pages) {
-      for (const op of ops) {
+      for (const op of textOps(ops)) {
         expect(op.y).toBeGreaterThanOrEqual(0);
         expect(op.y).toBeLessThanOrEqual(height);
       }
     }
+  });
+
+  it("landscape pages are wider than tall", () => {
+    const { width, height } = layoutDocument({
+      orientation: "landscape",
+      blocks: [{ type: "text", text: "wide" }],
+    });
+    expect(width).toBeGreaterThan(height);
   });
 });
 
